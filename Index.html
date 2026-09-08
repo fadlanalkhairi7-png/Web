@@ -1,0 +1,1768 @@
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
+
+/* ============================================================
+   SIMOJI — Sistem Monitoring Kenaikan Gaji Berkala
+   • Masuk dengan memilih peran: pegawai atau admin
+   • Kata sandi disimpan sebagai turunan PBKDF2 bergaram
+   • Isi berkas & lampiran dienkripsi AES-GCM sebelum disimpan
+   • Profil pegawai, reset sandi oleh admin, log aktivitas
+   ============================================================ */
+
+const V = "simoji:v3:";
+const KEY_AKUN = V + "akun";
+const KEY_LIST = V + "pengajuan";
+const KEY_LOG = V + "log";
+const KEY_SESI = V + "sesi";
+const KEY_GAGAL = V + "gagal";
+const fotoKey = (id) => V + "foto:" + id;
+
+const KODE_ADMIN = "admin123";      // hanya dipakai bila sudah ada admin
+const ITERASI = 210000;             // putaran PBKDF2 untuk kata sandi
+const SESI_JAM = 8;                 // sesi kedaluwarsa
+const MAKS_GAGAL = 5;
+const KUNCI_MENIT = 10;
+
+const GOLONGAN = ["I/a","I/b","I/c","I/d","II/a","II/b","II/c","II/d","III/a","III/b","III/c","III/d","IV/a","IV/b","IV/c","IV/d","IV/e"];
+
+const STATUS = {
+  diajukan:  { label: "Menunggu verifikasi", warna: "biru" },
+  perbaikan: { label: "Perlu perbaikan",     warna: "amber" },
+  disetujui: { label: "Disetujui",           warna: "hijau" },
+  ditolak:   { label: "Ditolak",             warna: "rust" },
+};
+
+/* ============================================================
+   Utilitas
+   ============================================================ */
+
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+const angkaSaja = (s) => String(s || "").replace(/[^\d]/g, "");
+const bersihkan = (s, maks = 120) => String(s || "").replace(/[<>]/g, "").trim().slice(0, maks);
+
+const BULAN = ["Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember"];
+const BULAN_S = ["Jan","Feb","Mar","Apr","Mei","Jun","Jul","Agu","Sep","Okt","Nov","Des"];
+
+function tambahTahun(iso, n) {
+  if (!iso) return "";
+  const d = new Date(iso + "T00:00:00");
+  if (isNaN(d)) return "";
+  d.setFullYear(d.getFullYear() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+function tglIndo(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso + "T00:00:00");
+  return isNaN(d) ? "—" : `${d.getDate()} ${BULAN[d.getMonth()]} ${d.getFullYear()}`;
+}
+
+function tglSingkat(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso + "T00:00:00");
+  return isNaN(d) ? "—" : `${d.getDate()} ${BULAN_S[d.getMonth()]} ${d.getFullYear()}`;
+}
+
+function jamTanggal(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()} ${p(d.getHours())}.${p(d.getMinutes())}`;
+}
+
+function selisihHari(iso) {
+  if (!iso) return null;
+  const d = new Date(iso + "T00:00:00");
+  if (isNaN(d)) return null;
+  const kini = new Date();
+  kini.setHours(0, 0, 0, 0);
+  return Math.round((d - kini) / 86400000);
+}
+
+function rupiah(n) {
+  const v = Number(n);
+  if (!v && v !== 0) return "—";
+  return "Rp " + v.toLocaleString("id-ID");
+}
+
+function waktuRelatif(ts) {
+  if (!ts) return "—";
+  const d = Math.floor((Date.now() - ts) / 1000);
+  if (d < 60) return "baru saja";
+  if (d < 3600) return `${Math.floor(d / 60)} menit lalu`;
+  if (d < 86400) return `${Math.floor(d / 3600)} jam lalu`;
+  return `${Math.floor(d / 86400)} hari lalu`;
+}
+
+function nilaiSandi(s) {
+  let n = 0;
+  if (s.length >= 8) n++;
+  if (s.length >= 12) n++;
+  if (/[a-z]/.test(s) && /[A-Z]/.test(s)) n++;
+  if (/\d/.test(s)) n++;
+  if (/[^A-Za-z0-9]/.test(s)) n++;
+  return Math.min(n, 4);
+}
+
+function periksaSandi(s) {
+  if (s.length < 8) return "Kata sandi minimal 8 karakter.";
+  if (!/[A-Za-z]/.test(s) || !/\d/.test(s)) return "Kata sandi harus memuat huruf dan angka.";
+  if (/^(123|password|admin|qwerty)/i.test(s)) return "Kata sandi terlalu mudah ditebak.";
+  return "";
+}
+
+/* ============================================================
+   Kriptografi
+   ============================================================ */
+
+const sandiBisa = typeof crypto !== "undefined" && crypto.subtle;
+const teksKe = (s) => new TextEncoder().encode(s);
+
+function keB64(u8) {
+  let s = "";
+  const potong = 0x8000;
+  for (let i = 0; i < u8.length; i += potong) s += String.fromCharCode.apply(null, u8.subarray(i, i + potong));
+  return btoa(s);
+}
+
+function dariB64(s) {
+  const bin = atob(s);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
+
+/* --- turunan kata sandi: PBKDF2-SHA256 bergaram acak --- */
+async function turunkanSandi(sandi, garamB64, iterasi = ITERASI) {
+  if (!sandiBisa) {
+    let h = 5381;
+    const t = garamB64 + "|" + sandi;
+    for (let i = 0; i < t.length; i++) h = ((h << 5) + h + t.charCodeAt(i)) >>> 0;
+    return "lemah:" + h.toString(16);
+  }
+  const bahan = await crypto.subtle.importKey("raw", teksKe(sandi), "PBKDF2", false, ["deriveBits"]);
+  const bit = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt: dariB64(garamB64), iterations: iterasi, hash: "SHA-256" },
+    bahan, 256
+  );
+  return keB64(new Uint8Array(bit));
+}
+
+function garamBaru() {
+  const u8 = new Uint8Array(16);
+  if (sandiBisa) crypto.getRandomValues(u8);
+  else for (let i = 0; i < 16; i++) u8[i] = Math.floor(Math.random() * 256);
+  return keB64(u8);
+}
+
+/* perbandingan waktu tetap, agar tidak bocor lewat lama pembandingan */
+function samaAman(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+  let beda = 0;
+  for (let i = 0; i < a.length; i++) beda |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return beda === 0;
+}
+
+/* --- penyandian isi simpanan: AES-GCM --- */
+let _kunci = null;
+async function kunciSimpan() {
+  if (_kunci) return _kunci;
+  const bahan = await crypto.subtle.importKey("raw", teksKe("simoji-penyandi-lokal"), "PBKDF2", false, ["deriveKey"]);
+  _kunci = await crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt: teksKe("simoji-garam-simpanan"), iterations: 120000, hash: "SHA-256" },
+    bahan, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]
+  );
+  return _kunci;
+}
+
+async function sandikan(nilai) {
+  const teks = JSON.stringify(nilai);
+  if (!sandiBisa) return "polos." + teks;
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const k = await kunciSimpan();
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, k, teksKe(teks));
+  return "aes." + keB64(iv) + "." + keB64(new Uint8Array(ct));
+}
+
+async function bukaSandi(teks) {
+  if (typeof teks !== "string") return null;
+  if (teks.startsWith("polos.")) return JSON.parse(teks.slice(6));
+  if (!teks.startsWith("aes.")) return JSON.parse(teks);
+  const [, ivB64, ctB64] = teks.split(".");
+  const k = await kunciSimpan();
+  const buf = await crypto.subtle.decrypt({ name: "AES-GCM", iv: dariB64(ivB64) }, k, dariB64(ctB64));
+  return JSON.parse(new TextDecoder().decode(buf));
+}
+
+/* ============================================================
+   Penyimpanan
+   ============================================================ */
+
+async function bacaAman(kunci, bawaan) {
+  try {
+    const r = await window.storage.get(kunci, true);
+    if (!r || !r.value) return bawaan;
+    const isi = await bukaSandi(r.value);
+    return isi === null || isi === undefined ? bawaan : isi;
+  } catch {
+    return bawaan;
+  }
+}
+
+async function tulisAman(kunci, nilai) {
+  await window.storage.set(kunci, await sandikan(nilai), true);
+}
+
+const ambilAkun = () => bacaAman(KEY_AKUN, []).then((a) => (Array.isArray(a) ? a : []));
+const simpanAkun = (a) => tulisAman(KEY_AKUN, a);
+const ambilDaftar = () => bacaAman(KEY_LIST, []).then((a) => (Array.isArray(a) ? a : []));
+const simpanDaftar = (d) => tulisAman(KEY_LIST, d);
+const ambilLog = () => bacaAman(KEY_LOG, []).then((a) => (Array.isArray(a) ? a : []));
+
+async function catat(aktor, aksi, rincian = "") {
+  try {
+    const log = await ambilLog();
+    await tulisAman(KEY_LOG, [{ ts: Date.now(), aktor, aksi, rincian }, ...log].slice(0, 300));
+  } catch { /* log tidak boleh menggagalkan aksi utama */ }
+}
+
+/* pengunci percobaan masuk, per peramban */
+async function cekKunci() {
+  try {
+    const r = await window.storage.get(KEY_GAGAL, false);
+    const d = r ? JSON.parse(r.value) : null;
+    if (!d) return 0;
+    if (d.jumlah >= MAKS_GAGAL && Date.now() - d.ts < KUNCI_MENIT * 60000) {
+      return Math.ceil((KUNCI_MENIT * 60000 - (Date.now() - d.ts)) / 60000);
+    }
+    return 0;
+  } catch { return 0; }
+}
+
+async function tandaiGagal() {
+  try {
+    const r = await window.storage.get(KEY_GAGAL, false);
+    const d = r ? JSON.parse(r.value) : { jumlah: 0, ts: Date.now() };
+    const baru = Date.now() - d.ts > KUNCI_MENIT * 60000
+      ? { jumlah: 1, ts: Date.now() }
+      : { jumlah: d.jumlah + 1, ts: d.ts };
+    await window.storage.set(KEY_GAGAL, JSON.stringify(baru), false);
+    return MAKS_GAGAL - baru.jumlah;
+  } catch { return MAKS_GAGAL; }
+}
+
+async function hapusGagal() {
+  try { await window.storage.delete(KEY_GAGAL, false); } catch { /* tidak penting */ }
+}
+
+/* ============================================================
+   Gambar
+   ============================================================ */
+
+function kompresGambar(file, maxDim = 1200, mutu = 0.7) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        let w = img.width, h = img.height;
+        const skala = Math.min(1, maxDim / Math.max(w, h));
+        w = Math.round(w * skala); h = Math.round(h * skala);
+        const c = document.createElement("canvas");
+        c.width = w; c.height = h;
+        const ctx = c.getContext("2d");
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve(c.toDataURL("image/jpeg", mutu));
+      };
+      img.onerror = () => reject(new Error("Berkas itu bukan gambar yang bisa dibaca."));
+      img.src = fr.result;
+    };
+    fr.onerror = () => reject(new Error("Berkas gagal dibuka. Coba pilih ulang."));
+    fr.readAsDataURL(file);
+  });
+}
+
+/* ============================================================
+   Bagian tampilan kecil
+   ============================================================ */
+
+function Lencana({ status }) {
+  const s = STATUS[status] || STATUS.diajukan;
+  return <span className={`sj-badge sj-badge-${s.warna}`}>{s.label}</span>;
+}
+
+function Baris({ label, children }) {
+  return (
+    <div className="sj-kv">
+      <span className="sj-kv-l">{label}</span>
+      <span className="sj-kv-v">{children}</span>
+    </div>
+  );
+}
+
+function KekuatanSandi({ sandi }) {
+  if (!sandi) return null;
+  const n = nilaiSandi(sandi);
+  const teks = ["Sangat lemah", "Lemah", "Cukup", "Kuat", "Sangat kuat"][n];
+  return (
+    <div className="sj-kekuatan">
+      <div className="sj-kekuatan-bar">
+        {[0, 1, 2, 3].map((i) => <span key={i} className={i < n ? `terisi t${n}` : ""} />)}
+      </div>
+      <span className="sj-row-meta">{teks}</span>
+    </div>
+  );
+}
+
+function PenggarisKGB({ tmtLama, tmtBaru }) {
+  const total = 24;
+  let terpakai = 0;
+  if (tmtLama && tmtBaru) {
+    const a = new Date(tmtLama + "T00:00:00");
+    const b = new Date(tmtBaru + "T00:00:00");
+    const rentang = b - a;
+    terpakai = Math.max(0, Math.min(1, rentang > 0 ? (new Date() - a) / rentang : 0)) * total;
+  }
+  const sisa = selisihHari(tmtBaru);
+  const ticks = Array.from({ length: total + 1 }, (_, i) => i);
+
+  return (
+    <section className="sj-ruler">
+      <div className="sj-ruler-head">
+        <div>
+          <div className="sj-ruler-num">
+            {sisa === null ? "—" : Math.abs(sisa)}
+            <span className="sj-ruler-unit">{sisa === null ? "" : sisa >= 0 ? " hari lagi" : " hari terlewat"}</span>
+          </div>
+          <div className="sj-ruler-sub">Menuju kenaikan gaji berkala berikutnya</div>
+        </div>
+        <div className="sj-ruler-tgl">
+          <div className="sj-kv-l">Terhitung mulai</div>
+          <div className="sj-ruler-tgl-v">{tglIndo(tmtBaru)}</div>
+        </div>
+      </div>
+      <div className="sj-ruler-track">
+        <div className="sj-ruler-fill" style={{ width: `${(terpakai / total) * 100}%` }} />
+        <div className="sj-ruler-ticks">
+          {ticks.map((i) => <span key={i} className={i % 6 === 0 ? "sj-tick sj-tick-mayor" : "sj-tick"} />)}
+        </div>
+        <div className="sj-ruler-mark" style={{ left: `${(terpakai / total) * 100}%` }} />
+      </div>
+      <div className="sj-ruler-foot">
+        <span>{tglSingkat(tmtLama)}</span>
+        <span>bulan ke-6</span>
+        <span>bulan ke-12</span>
+        <span>bulan ke-18</span>
+        <span>{tglSingkat(tmtBaru)}</span>
+      </div>
+    </section>
+  );
+}
+
+/* ============================================================
+   Masuk & buat akun
+   ============================================================ */
+
+function LayarMasuk({ onMasuk }) {
+  const [mode, setMode] = useState("masuk");
+  const [peran, setPeran] = useState("pegawai");
+  const [nip, setNip] = useState("");
+  const [sandi, setSandi] = useState("");
+  const [nama, setNama] = useState("");
+  const [ulangi, setUlangi] = useState("");
+  const [kode, setKode] = useState("");
+  const [galat, setGalat] = useState("");
+  const [sibuk, setSibuk] = useState(false);
+  const [adaAdmin, setAdaAdmin] = useState(null);
+  const [terkunci, setTerkunci] = useState(0);
+
+  useEffect(() => {
+    ambilAkun().then((a) => setAdaAdmin(a.some((x) => x.peran === "admin")));
+    cekKunci().then(setTerkunci);
+  }, []);
+
+  function bersih() { setGalat(""); setSandi(""); setUlangi(""); setKode(""); }
+
+  async function kirimMasuk() {
+    setGalat("");
+    const sisaKunci = await cekKunci();
+    if (sisaKunci) return setGalat(`Terlalu banyak percobaan gagal. Coba lagi ${sisaKunci} menit lagi.`);
+    const n = angkaSaja(nip);
+    if (!n || !sandi) return setGalat("Isi NIP dan kata sandi.");
+
+    setSibuk(true);
+    try {
+      const akun = await ambilAkun();
+      const cocok = akun.find((a) => a.nip === n);
+      const hash = cocok ? await turunkanSandi(sandi, cocok.garam, cocok.iterasi || ITERASI) : "";
+      if (!cocok || !samaAman(hash, cocok.hash)) {
+        const sisa = await tandaiGagal();
+        setSibuk(false);
+        return setGalat(sisa > 0
+          ? `NIP atau kata sandi salah. Sisa ${sisa} percobaan.`
+          : `Akses dikunci ${KUNCI_MENIT} menit karena terlalu banyak percobaan.`);
+      }
+      if (cocok.peran !== peran) {
+        setSibuk(false);
+        return setGalat(`Akun ini terdaftar sebagai ${cocok.peran}. Pilih "Masuk sebagai ${cocok.peran}".`);
+      }
+      await hapusGagal();
+      const sisaAkun = akun.map((a) => a.id === cocok.id ? { ...a, terakhirMasuk: Date.now() } : a);
+      await simpanAkun(sisaAkun);
+      await catat(cocok.nama, "Masuk", `sebagai ${cocok.peran}`);
+      onMasuk(cocok);
+    } catch {
+      setSibuk(false);
+      setGalat("Gagal membaca data akun. Coba lagi.");
+    }
+  }
+
+  async function kirimDaftar() {
+    setGalat("");
+    const n = angkaSaja(nip);
+    if (bersihkan(nama).length < 3) return setGalat("Tulis nama lengkap Anda.");
+    if (n.length < 8) return setGalat("NIP minimal 8 angka.");
+    const pesan = periksaSandi(sandi);
+    if (pesan) return setGalat(pesan);
+    if (sandi !== ulangi) return setGalat("Ulangan kata sandi belum sama.");
+    if (peran === "admin" && adaAdmin && kode.trim() !== KODE_ADMIN) {
+      return setGalat("Kode admin tidak cocok.");
+    }
+
+    setSibuk(true);
+    try {
+      const akun = await ambilAkun();
+      if (akun.some((a) => a.nip === n)) {
+        setSibuk(false);
+        return setGalat("NIP ini sudah punya akun. Silakan masuk.");
+      }
+      const garam = garamBaru();
+      const baru = {
+        id: uid(), nip: n, nama: bersihkan(nama), peran,
+        garam, iterasi: ITERASI, hash: await turunkanSandi(sandi, garam),
+        profil: {}, wajibGanti: false, dibuat: Date.now(), terakhirMasuk: Date.now(),
+      };
+      await simpanAkun([...akun, baru]);
+      await catat(baru.nama, "Buat akun", `peran ${peran}`);
+      await hapusGagal();
+      onMasuk(baru);
+    } catch {
+      setSibuk(false);
+      setGalat("Akun gagal disimpan. Coba lagi.");
+    }
+  }
+
+  const daftarMode = mode === "daftar";
+  const adminPertama = peran === "admin" && adaAdmin === false;
+
+  return (
+    <div className="sj-masuk">
+      <aside className="sj-masuk-kiri">
+        <div className="sj-lambang">
+          <span /><span /><span />
+        </div>
+        <h1 className="sj-brand">Simoji</h1>
+        <p className="sj-brand-sub">Sistem monitoring kenaikan gaji berkala</p>
+        <p className="sj-masuk-teks">
+          Pegawai mencatat SK berkala terakhir beserta pindaiannya. Bagian kepegawaian
+          memeriksa berkas yang masuk, lalu menyetujui atau mengembalikannya untuk diperbaiki.
+        </p>
+        <ul className="sj-masuk-daftar">
+          <li>Kata sandi disimpan sebagai turunan PBKDF2 bergaram, bukan teks asli.</li>
+          <li>Isi berkas dan lampiran disandikan AES-GCM sebelum masuk penyimpanan.</li>
+          <li>Percobaan masuk dibatasi {MAKS_GAGAL} kali sebelum dikunci {KUNCI_MENIT} menit.</li>
+        </ul>
+      </aside>
+
+      <section className="sj-masuk-kanan">
+        <div className="sj-tabs" role="tablist">
+          <button role="tab" aria-selected={!daftarMode} className={`sj-tab ${!daftarMode ? "aktif" : ""}`}
+            onClick={() => { setMode("masuk"); bersih(); }}>Masuk</button>
+          <button role="tab" aria-selected={daftarMode} className={`sj-tab ${daftarMode ? "aktif" : ""}`}
+            onClick={() => { setMode("daftar"); bersih(); }}>Buat akun</button>
+        </div>
+
+        <div className="sj-segmen" role="group" aria-label="Pilih peran">
+          <button className={peran === "pegawai" ? "aktif" : ""} onClick={() => { setPeran("pegawai"); setGalat(""); }}>
+            {daftarMode ? "Daftar sebagai pegawai" : "Masuk sebagai pegawai"}
+          </button>
+          <button className={peran === "admin" ? "aktif" : ""} onClick={() => { setPeran("admin"); setGalat(""); }}>
+            {daftarMode ? "Daftar sebagai admin" : "Masuk sebagai admin"}
+          </button>
+        </div>
+
+        <div className="sj-form">
+          {daftarMode && (
+            <label className="sj-field">
+              <span>Nama lengkap</span>
+              <input value={nama} onChange={(e) => setNama(e.target.value)} placeholder="Siti Rahmawati, S.Pd." />
+            </label>
+          )}
+
+          <label className="sj-field">
+            <span>NIP</span>
+            <input value={nip} inputMode="numeric" autoComplete="username"
+              onChange={(e) => setNip(angkaSaja(e.target.value).slice(0, 18))}
+              placeholder="198703142010012001" />
+          </label>
+
+          <label className="sj-field">
+            <span>Kata sandi</span>
+            <input type="password" value={sandi} autoComplete={daftarMode ? "new-password" : "current-password"}
+              onChange={(e) => setSandi(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && !daftarMode && !sibuk && kirimMasuk()}
+              placeholder={daftarMode ? "Huruf dan angka, minimal 8 karakter" : "••••••••"} />
+            {daftarMode && <KekuatanSandi sandi={sandi} />}
+          </label>
+
+          {daftarMode && (
+            <label className="sj-field">
+              <span>Ulangi kata sandi</span>
+              <input type="password" value={ulangi} autoComplete="new-password"
+                onChange={(e) => setUlangi(e.target.value)} placeholder="••••••••" />
+            </label>
+          )}
+
+          {daftarMode && peran === "admin" && adaAdmin === true && (
+            <label className="sj-field">
+              <span>Kode admin</span>
+              <input type="password" value={kode} onChange={(e) => setKode(e.target.value)} placeholder="••••••••" />
+              <span className="sj-bantuan">Kode bawaan untuk uji coba: <code>{KODE_ADMIN}</code>. Admin yang sudah ada juga bisa membuatkan akun langsung dari panelnya.</span>
+            </label>
+          )}
+
+          {daftarMode && adminPertama && (
+            <p className="sj-info">Belum ada admin sama sekali, jadi akun admin pertama bisa dibuat tanpa kode.</p>
+          )}
+        </div>
+
+        {terkunci > 0 && !galat && <div className="sj-galat">Akses dikunci sementara, coba lagi {terkunci} menit lagi.</div>}
+        {galat && <div className="sj-galat">{galat}</div>}
+
+        <button className="sj-btn sj-btn-utama" disabled={sibuk} onClick={daftarMode ? kirimDaftar : kirimMasuk}>
+          {sibuk ? "Memproses…" : daftarMode ? "Buat akun" : `Masuk sebagai ${peran}`}
+        </button>
+
+        {!sandiBisa && (
+          <p className="sj-galat">Peramban ini tidak menyediakan Web Crypto, jadi penyandian dimatikan. Buka lewat koneksi https.</p>
+        )}
+      </section>
+    </div>
+  );
+}
+
+/* ============================================================
+   Profil pegawai
+   ============================================================ */
+
+const PROFIL_KOSONG = {
+  pangkat: "", golongan: "III/a", jabatan: "", unit: "", satker: "",
+  masaKerjaTahun: "", masaKerjaBulan: "", noHp: "",
+};
+
+function ProfilPegawai({ sesi, onSimpan }) {
+  const [p, setP] = useState({ ...PROFIL_KOSONG, ...(sesi.profil || {}) });
+  const [nama, setNama] = useState(sesi.nama);
+  const [sibuk, setSibuk] = useState(false);
+  const [pesan, setPesan] = useState("");
+  const set = (k) => (e) => setP((x) => ({ ...x, [k]: e.target.value }));
+
+  async function simpan() {
+    setPesan("");
+    if (bersihkan(nama).length < 3) return setPesan("Nama tidak boleh kosong.");
+    setSibuk(true);
+    const hasil = await onSimpan(bersihkan(nama), {
+      ...p,
+      pangkat: bersihkan(p.pangkat), jabatan: bersihkan(p.jabatan),
+      unit: bersihkan(p.unit), satker: bersihkan(p.satker),
+      noHp: angkaSaja(p.noHp).slice(0, 15),
+      masaKerjaTahun: angkaSaja(p.masaKerjaTahun).slice(0, 2),
+      masaKerjaBulan: angkaSaja(p.masaKerjaBulan).slice(0, 2),
+    });
+    setSibuk(false);
+    setPesan(hasil === true ? "Profil tersimpan." : hasil || "Profil gagal disimpan.");
+  }
+
+  return (
+    <div className="sj-panel">
+      <div className="sj-panel-head">
+        <h2>Profil kepegawaian</h2>
+        <span className="sj-row-meta">NIP {sesi.nip}</span>
+      </div>
+      <p className="sj-bantuan">Data di sini terisi otomatis setiap kali Anda membuat pengajuan baru, jadi tidak perlu diketik ulang.</p>
+
+      <div className="sj-grid2 sj-mt">
+        <label className="sj-field"><span>Nama lengkap</span>
+          <input value={nama} onChange={(e) => setNama(e.target.value)} /></label>
+        <label className="sj-field"><span>Nomor telepon</span>
+          <input value={p.noHp} inputMode="numeric" onChange={(e) => setP((x) => ({ ...x, noHp: angkaSaja(e.target.value).slice(0, 15) }))} placeholder="08123456789" /></label>
+        <label className="sj-field"><span>Pangkat</span>
+          <input value={p.pangkat} onChange={set("pangkat")} placeholder="Penata Muda Tingkat I" /></label>
+        <label className="sj-field"><span>Golongan ruang</span>
+          <select value={p.golongan} onChange={set("golongan")}>
+            {GOLONGAN.map((g) => <option key={g} value={g}>{g}</option>)}
+          </select></label>
+        <label className="sj-field"><span>Jabatan</span>
+          <input value={p.jabatan} onChange={set("jabatan")} placeholder="Guru Ahli Pertama" /></label>
+        <label className="sj-field"><span>Unit kerja</span>
+          <input value={p.unit} onChange={set("unit")} placeholder="SMPN 3 Medan" /></label>
+        <label className="sj-field"><span>Satuan kerja induk</span>
+          <input value={p.satker} onChange={set("satker")} placeholder="Dinas Pendidikan Kota Medan" /></label>
+        <div className="sj-grid2">
+          <label className="sj-field"><span>Masa kerja (tahun)</span>
+            <input value={p.masaKerjaTahun} inputMode="numeric" onChange={(e) => setP((x) => ({ ...x, masaKerjaTahun: angkaSaja(e.target.value).slice(0, 2) }))} placeholder="10" /></label>
+          <label className="sj-field"><span>Bulan</span>
+            <input value={p.masaKerjaBulan} inputMode="numeric" onChange={(e) => setP((x) => ({ ...x, masaKerjaBulan: angkaSaja(e.target.value).slice(0, 2) }))} placeholder="4" /></label>
+        </div>
+      </div>
+
+      {pesan && <div className={pesan === "Profil tersimpan." ? "sj-info" : "sj-galat"}>{pesan}</div>}
+      <div className="sj-aksi">
+        <button className="sj-btn sj-btn-utama" onClick={simpan} disabled={sibuk}>
+          {sibuk ? "Menyimpan…" : "Simpan profil"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   Formulir pengajuan
+   ============================================================ */
+
+function FormPengajuan({ sesi, onSelesai, onBatal }) {
+  const pr = sesi.profil || {};
+  const [f, setF] = useState({
+    pangkat: pr.pangkat || "", golongan: pr.golongan || "III/a",
+    jabatan: pr.jabatan || "", unit: pr.unit || "",
+    masaKerjaTahun: pr.masaKerjaTahun || "", masaKerjaBulan: pr.masaKerjaBulan || "",
+    noSk: "", tmtLama: "", tmtBaru: "", gajiLama: "", gajiBaru: "", catatan: "",
+  });
+  const [foto, setFoto] = useState(null);
+  const [namaFoto, setNamaFoto] = useState("");
+  const [sibuk, setSibuk] = useState(false);
+  const [galat, setGalat] = useState("");
+  const inputFoto = useRef(null);
+  const adaProfil = !!(pr.pangkat && pr.unit);
+
+  const set = (k) => (e) => setF((p) => ({ ...p, [k]: e.target.value }));
+
+  function ubahTmtLama(e) {
+    const v = e.target.value;
+    setF((p) => ({ ...p, tmtLama: v, tmtBaru: p.tmtBaru || tambahTahun(v, 2) }));
+  }
+
+  async function pilihFoto(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setGalat("");
+    if (!file.type.startsWith("image/")) return setGalat("Unggah pindaian dalam bentuk gambar (JPG atau PNG).");
+    if (file.size > 12 * 1024 * 1024) return setGalat("Ukuran gambar melebihi 12 MB.");
+    try {
+      setFoto(await kompresGambar(file));
+      setNamaFoto(bersihkan(file.name, 80));
+    } catch (err) { setGalat(err.message); }
+  }
+
+  async function kirim() {
+    setGalat("");
+    if (!f.pangkat.trim()) return setGalat("Isi pangkat Anda.");
+    if (!f.unit.trim()) return setGalat("Isi unit kerja Anda.");
+    if (!f.tmtLama) return setGalat("Isi TMT gaji berkala terakhir.");
+    if (!f.tmtBaru) return setGalat("Isi TMT gaji berkala berikutnya.");
+    if (new Date(f.tmtBaru) <= new Date(f.tmtLama)) return setGalat("TMT berikutnya harus setelah TMT terakhir.");
+    if (!f.gajiLama) return setGalat("Isi gaji pokok saat ini.");
+    if (!foto) return setGalat("Lampirkan pindaian SK gaji berkala terakhir.");
+
+    setSibuk(true);
+    try {
+      const id = uid();
+      await window.storage.set(fotoKey(id), await sandikan(foto), true);
+      const daftar = await ambilDaftar();
+      const rekaman = {
+        id, nip: sesi.nip, nama: sesi.nama,
+        pangkat: bersihkan(f.pangkat), golongan: f.golongan,
+        jabatan: bersihkan(f.jabatan), unit: bersihkan(f.unit),
+        masaKerja: `${angkaSaja(f.masaKerjaTahun) || 0} tahun ${angkaSaja(f.masaKerjaBulan) || 0} bulan`,
+        noSk: bersihkan(f.noSk, 60), tmtLama: f.tmtLama, tmtBaru: f.tmtBaru,
+        gajiLama: Number(angkaSaja(f.gajiLama)) || 0,
+        gajiBaru: Number(angkaSaja(f.gajiBaru)) || 0,
+        catatan: bersihkan(f.catatan, 400), namaFoto,
+        status: "diajukan", catatanAdmin: "",
+        dibuat: Date.now(), diperbarui: Date.now(),
+      };
+      await simpanDaftar([rekaman, ...daftar]);
+      await catat(sesi.nama, "Kirim pengajuan", `TMT ${f.tmtBaru}`);
+      onSelesai(rekaman);
+    } catch {
+      setGalat("Pengajuan gagal disimpan. Periksa koneksi lalu kirim ulang.");
+      setSibuk(false);
+    }
+  }
+
+  const selisihGaji = (Number(angkaSaja(f.gajiBaru)) || 0) - (Number(angkaSaja(f.gajiLama)) || 0);
+  const sisaHari = selisihHari(f.tmtBaru);
+
+  return (
+    <div className="sj-panel">
+      <div className="sj-panel-head">
+        <h2>Ajukan kenaikan gaji berkala</h2>
+        <button className="sj-btn sj-btn-teks" onClick={onBatal}>Kembali</button>
+      </div>
+
+      {adaProfil
+        ? <p className="sj-info">Data kepegawaian terisi dari profil Anda. Ubah di sini bila ada yang berbeda.</p>
+        : <p className="sj-bantuan">Isi menu Profil sekali saja supaya bagian ini terisi sendiri pada pengajuan berikutnya.</p>}
+
+      <div className="sj-grid2 sj-mt">
+        <label className="sj-field"><span>Pangkat</span>
+          <input value={f.pangkat} onChange={set("pangkat")} placeholder="Penata Muda Tingkat I" /></label>
+        <label className="sj-field"><span>Golongan ruang</span>
+          <select value={f.golongan} onChange={set("golongan")}>
+            {GOLONGAN.map((g) => <option key={g} value={g}>{g}</option>)}
+          </select></label>
+        <label className="sj-field"><span>Jabatan</span>
+          <input value={f.jabatan} onChange={set("jabatan")} placeholder="Guru Ahli Pertama" /></label>
+        <label className="sj-field"><span>Unit kerja</span>
+          <input value={f.unit} onChange={set("unit")} placeholder="SMPN 3 Medan" /></label>
+      </div>
+
+      <div className="sj-sub">Masa kerja golongan</div>
+      <div className="sj-grid2">
+        <label className="sj-field"><span>Tahun</span>
+          <input value={f.masaKerjaTahun} inputMode="numeric"
+            onChange={(e) => setF((p) => ({ ...p, masaKerjaTahun: angkaSaja(e.target.value).slice(0, 2) }))} placeholder="10" /></label>
+        <label className="sj-field"><span>Bulan</span>
+          <input value={f.masaKerjaBulan} inputMode="numeric"
+            onChange={(e) => setF((p) => ({ ...p, masaKerjaBulan: angkaSaja(e.target.value).slice(0, 2) }))} placeholder="4" /></label>
+      </div>
+
+      <div className="sj-sub">Data gaji berkala</div>
+      <div className="sj-grid2">
+        <label className="sj-field"><span>Nomor SK berkala terakhir</span>
+          <input value={f.noSk} onChange={set("noSk")} placeholder="821.2/145/BKD/2024" /></label>
+        <label className="sj-field"><span>TMT berkala terakhir</span>
+          <input type="date" value={f.tmtLama} onChange={ubahTmtLama} /></label>
+        <label className="sj-field"><span>TMT berkala berikutnya</span>
+          <input type="date" value={f.tmtBaru} onChange={set("tmtBaru")} /></label>
+        <label className="sj-field"><span>Gaji pokok saat ini</span>
+          <input value={f.gajiLama ? Number(f.gajiLama).toLocaleString("id-ID") : ""} inputMode="numeric"
+            onChange={(e) => setF((p) => ({ ...p, gajiLama: angkaSaja(e.target.value) }))} placeholder="3.203.600" /></label>
+        <label className="sj-field"><span>Gaji pokok usulan</span>
+          <input value={f.gajiBaru ? Number(f.gajiBaru).toLocaleString("id-ID") : ""} inputMode="numeric"
+            onChange={(e) => setF((p) => ({ ...p, gajiBaru: angkaSaja(e.target.value) }))} placeholder="3.305.100" /></label>
+      </div>
+
+      {selisihGaji > 0 && <p className="sj-bantuan">Selisih yang diusulkan {rupiah(selisihGaji)} per bulan.</p>}
+      {f.tmtLama && f.tmtBaru && (
+        <p className="sj-bantuan">
+          Terhitung mulai {tglIndo(f.tmtBaru)} — {sisaHari >= 0 ? `${sisaHari} hari lagi.` : `sudah terlewat ${Math.abs(sisaHari)} hari.`}
+        </p>
+      )}
+
+      <div className="sj-sub">Lampiran</div>
+      <div className="sj-unggah">
+        <input ref={inputFoto} type="file" accept="image/*" onChange={pilihFoto} hidden />
+        {foto ? (
+          <div className="sj-pratinjau">
+            <img src={foto} alt="Pratinjau lampiran" />
+            <div>
+              <div className="sj-pratinjau-nama">{namaFoto}</div>
+              <div className="sj-bantuan">Gambar dikecilkan lalu disandikan sebelum disimpan.</div>
+              <button className="sj-btn sj-btn-teks" onClick={() => inputFoto.current.click()}>Ganti gambar</button>
+            </div>
+          </div>
+        ) : (
+          <button className="sj-drop" onClick={() => inputFoto.current.click()}>
+            <strong>Pilih pindaian SK berkala terakhir</strong>
+            <span>Format JPG atau PNG, satu gambar per pengajuan.</span>
+          </button>
+        )}
+      </div>
+
+      <label className="sj-field"><span>Catatan untuk kepegawaian</span>
+        <textarea rows={3} value={f.catatan} onChange={set("catatan")}
+          placeholder="Contoh: SK asli sudah diserahkan ke bagian umum pada 2 September." /></label>
+
+      {galat && <div className="sj-galat">{galat}</div>}
+
+      <div className="sj-aksi">
+        <button className="sj-btn sj-btn-utama" onClick={kirim} disabled={sibuk}>
+          {sibuk ? "Mengirim…" : "Kirim pengajuan"}
+        </button>
+        <button className="sj-btn sj-btn-halus" onClick={onBatal} disabled={sibuk}>Batal</button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   Beranda pegawai
+   ============================================================ */
+
+function BerandaPegawai({ sesi, daftar, memuat, onAjukan, onSegarkan }) {
+  const [detail, setDetail] = useState(null);
+  const milik = daftar.filter((d) => d.nip === sesi.nip);
+  const terakhir = milik[0];
+
+  return (
+    <>
+      {terakhir ? <PenggarisKGB tmtLama={terakhir.tmtLama} tmtBaru={terakhir.tmtBaru} /> : (
+        <div className="sj-kosong">
+          <h2>Belum ada pengajuan atas nama Anda</h2>
+          <p>Catat SK berkala terakhir Anda sekali, lalu Simoji menghitung sendiri kapan berkala berikutnya jatuh tempo.</p>
+          <button className="sj-btn sj-btn-utama" onClick={onAjukan}>Ajukan sekarang</button>
+        </div>
+      )}
+
+      <div className="sj-panel-head sj-mt">
+        <h2>Riwayat pengajuan</h2>
+        <div className="sj-aksi-kanan">
+          <button className="sj-btn sj-btn-teks" onClick={onSegarkan}>Muat ulang</button>
+          <button className="sj-btn sj-btn-utama" onClick={onAjukan}>Pengajuan baru</button>
+        </div>
+      </div>
+
+      {memuat && <p className="sj-bantuan">Memuat data…</p>}
+      {!memuat && !milik.length && <p className="sj-bantuan">Riwayat muncul di sini setelah pengajuan pertama terkirim.</p>}
+
+      {!!milik.length && (
+        <div className="sj-tabel">
+          <div className="sj-thead sj-row3">
+            <span>Berlaku mulai</span><span>Gaji usulan</span><span>Status</span>
+          </div>
+          {milik.map((d) => (
+            <button key={d.id} className="sj-trow sj-row3" onClick={() => setDetail(d)}>
+              <span className="sj-td">
+                <strong>{tglSingkat(d.tmtBaru)}</strong>
+                <span className="sj-row-meta">{d.pangkat} · {d.golongan} · {d.unit}</span>
+              </span>
+              <span className="sj-td sj-td-num">{rupiah(d.gajiBaru || d.gajiLama)}
+                <span className="sj-row-meta">dikirim {waktuRelatif(d.dibuat)}</span></span>
+              <span className="sj-td sj-td-status"><Lencana status={d.status} /></span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {detail && <DetailPengajuan data={detail} peran="pegawai" onTutup={() => setDetail(null)} />}
+    </>
+  );
+}
+
+/* ============================================================
+   Admin — berkas
+   ============================================================ */
+
+function BerkasAdmin({ daftar, memuat, onSegarkan, onUbahStatus, onHapus }) {
+  const [saring, setSaring] = useState("semua");
+  const [cari, setCari] = useState("");
+  const [detail, setDetail] = useState(null);
+
+  const ringkas = useMemo(() => ({
+    total: daftar.length,
+    menunggu: daftar.filter((d) => d.status === "diajukan").length,
+    disetujui: daftar.filter((d) => d.status === "disetujui").length,
+    jatuhTempo: daftar.filter((d) => {
+      const s = selisihHari(d.tmtBaru);
+      return s !== null && s <= 90 && d.status !== "disetujui";
+    }).length,
+  }), [daftar]);
+
+  const tersaring = useMemo(() => {
+    const q = cari.trim().toLowerCase();
+    return daftar.filter((d) => {
+      const st = saring === "semua" || d.status === saring;
+      const ok = !q || d.nama.toLowerCase().includes(q) || d.nip.includes(q) || (d.unit || "").toLowerCase().includes(q);
+      return st && ok;
+    });
+  }, [daftar, saring, cari]);
+
+  function unduhCsv() {
+    const kolom = ["Nama","NIP","Pangkat","Golongan","Unit kerja","TMT lama","TMT berikutnya","Gaji lama","Gaji usulan","Status"];
+    const baris = tersaring.map((d) => [d.nama, d.nip, d.pangkat, d.golongan, d.unit, d.tmtLama, d.tmtBaru, d.gajiLama, d.gajiBaru, STATUS[d.status]?.label || d.status]);
+    const csv = [kolom, ...baris].map((r) => r.map((s) => `"${String(s ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `simoji-kgb-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  return (
+    <>
+      <div className="sj-statbar">
+        <div className="sj-stat"><div className="sj-stat-n">{ringkas.menunggu}</div><div className="sj-stat-l">Menunggu diperiksa</div></div>
+        <div className="sj-stat"><div className="sj-stat-n sj-amber">{ringkas.jatuhTempo}</div><div className="sj-stat-l">Jatuh tempo ≤ 90 hari</div></div>
+        <div className="sj-stat"><div className="sj-stat-n sj-hijau">{ringkas.disetujui}</div><div className="sj-stat-l">Sudah disetujui</div></div>
+        <div className="sj-stat"><div className="sj-stat-n">{ringkas.total}</div><div className="sj-stat-l">Total berkas masuk</div></div>
+      </div>
+
+      <div className="sj-toolbar">
+        <div className="sj-chips">
+          {["semua","diajukan","perbaikan","disetujui","ditolak"].map((s) => (
+            <button key={s} className={`sj-chip ${saring === s ? "aktif" : ""}`} onClick={() => setSaring(s)}>
+              {s === "semua" ? "Semua" : STATUS[s].label}
+            </button>
+          ))}
+        </div>
+        <div className="sj-aksi-kanan">
+          <input className="sj-cari" value={cari} onChange={(e) => setCari(e.target.value)} placeholder="Cari nama, NIP, atau unit kerja" />
+          <button className="sj-btn sj-btn-teks" onClick={onSegarkan}>Muat ulang</button>
+          <button className="sj-btn sj-btn-halus" onClick={unduhCsv} disabled={!tersaring.length}>Unduh CSV</button>
+        </div>
+      </div>
+
+      {memuat && <p className="sj-bantuan">Memuat berkas…</p>}
+      {!memuat && !tersaring.length && <p className="sj-bantuan">Tidak ada berkas yang cocok dengan penyaring ini.</p>}
+
+      {!!tersaring.length && (
+        <div className="sj-tabel">
+          <div className="sj-thead sj-row5"><span>Pegawai</span><span>Golongan</span><span>Berlaku mulai</span><span>Gaji usulan</span><span>Status</span></div>
+          {tersaring.map((d) => {
+            const sisa = selisihHari(d.tmtBaru);
+            return (
+              <button key={d.id} className="sj-trow sj-row5" onClick={() => setDetail(d)}>
+                <span className="sj-td"><strong>{d.nama}</strong><span className="sj-row-meta">{d.nip}</span></span>
+                <span className="sj-td">{d.golongan}<span className="sj-row-meta">{d.unit}</span></span>
+                <span className="sj-td">{tglSingkat(d.tmtBaru)}
+                  <span className={`sj-row-meta ${sisa !== null && sisa <= 90 ? "sj-amber" : ""}`}>
+                    {sisa === null ? "" : sisa >= 0 ? `${sisa} hari lagi` : `terlewat ${Math.abs(sisa)} hari`}
+                  </span></span>
+                <span className="sj-td sj-td-num">{rupiah(d.gajiBaru || d.gajiLama)}
+                  <span className="sj-row-meta">masuk {waktuRelatif(d.dibuat)}</span></span>
+                <span className="sj-td sj-td-status"><Lencana status={d.status} /></span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {detail && (
+        <DetailPengajuan data={detail} peran="admin" onTutup={() => setDetail(null)}
+          onUbahStatus={(status, catatan) => { onUbahStatus(detail.id, status, catatan); setDetail(null); }}
+          onHapus={() => { onHapus(detail.id); setDetail(null); }} />
+      )}
+    </>
+  );
+}
+
+/* ============================================================
+   Admin — akun
+   ============================================================ */
+
+function AkunAdmin({ sesi, akun, memuat, onBuat, onHapus, onUbahPeran, onReset }) {
+  const [nama, setNama] = useState("");
+  const [nip, setNip] = useState("");
+  const [sandi, setSandi] = useState("");
+  const [peran, setPeran] = useState("admin");
+  const [galat, setGalat] = useState("");
+  const [sibuk, setSibuk] = useState(false);
+  const [hasilReset, setHasilReset] = useState(null);
+
+  function sandiAcak() {
+    const abjad = "abcdefghjkmnpqrstuvwxyz";
+    const angka = "23456789";
+    let s = "";
+    for (let i = 0; i < 6; i++) s += abjad[Math.floor(Math.random() * abjad.length)];
+    for (let i = 0; i < 3; i++) s += angka[Math.floor(Math.random() * angka.length)];
+    return s;
+  }
+
+  async function buat() {
+    setGalat(""); setHasilReset(null);
+    const n = angkaSaja(nip);
+    if (bersihkan(nama).length < 3) return setGalat("Tulis nama lengkap pemilik akun.");
+    if (n.length < 8) return setGalat("NIP minimal 8 angka.");
+    const pesan = periksaSandi(sandi);
+    if (pesan) return setGalat(pesan);
+    setSibuk(true);
+    const hasil = await onBuat({ nama: bersihkan(nama), nip: n, sandi, peran });
+    setSibuk(false);
+    if (hasil === true) { setNama(""); setNip(""); setSandi(""); }
+    else setGalat(hasil || "Akun gagal dibuat.");
+  }
+
+  async function reset(a) {
+    const baru = sandiAcak() + "A";
+    const hasil = await onReset(a.id, baru);
+    if (hasil === true) setHasilReset({ nama: a.nama, sandi: baru });
+  }
+
+  return (
+    <>
+      <div className="sj-statbar sj-statbar-2">
+        <div className="sj-stat"><div className="sj-stat-n">{akun.filter((a) => a.peran === "pegawai").length}</div><div className="sj-stat-l">Akun pegawai</div></div>
+        <div className="sj-stat"><div className="sj-stat-n sj-biru">{akun.filter((a) => a.peran === "admin").length}</div><div className="sj-stat-l">Akun admin</div></div>
+      </div>
+
+      <div className="sj-panel sj-mt">
+        <div className="sj-panel-head"><h2>Buat akun baru</h2></div>
+        <div className="sj-grid2">
+          <label className="sj-field"><span>Nama lengkap</span>
+            <input value={nama} onChange={(e) => setNama(e.target.value)} placeholder="Andi Pratama, S.E." /></label>
+          <label className="sj-field"><span>NIP</span>
+            <input value={nip} inputMode="numeric" onChange={(e) => setNip(angkaSaja(e.target.value).slice(0, 18))} placeholder="199001012015031002" /></label>
+          <label className="sj-field"><span>Kata sandi awal</span>
+            <span className="sj-gabung">
+              <input type="text" value={sandi} onChange={(e) => setSandi(e.target.value)} placeholder="Huruf dan angka, minimal 8" />
+              <button className="sj-btn sj-btn-halus" onClick={() => setSandi(sandiAcak() + "A")}>Buatkan</button>
+            </span></label>
+          <label className="sj-field"><span>Peran</span>
+            <select value={peran} onChange={(e) => setPeran(e.target.value)}>
+              <option value="admin">Admin kepegawaian</option>
+              <option value="pegawai">Pegawai</option>
+            </select></label>
+        </div>
+        <p className="sj-bantuan">Pemilik akun diminta mengganti kata sandi ini saat pertama kali masuk.</p>
+        {galat && <div className="sj-galat">{galat}</div>}
+        <div className="sj-aksi">
+          <button className="sj-btn sj-btn-utama" onClick={buat} disabled={sibuk}>{sibuk ? "Menyimpan…" : "Buat akun"}</button>
+        </div>
+      </div>
+
+      {hasilReset && (
+        <div className="sj-info sj-mt">
+          Kata sandi {hasilReset.nama} disetel ulang menjadi <code>{hasilReset.sandi}</code>. Sampaikan langsung ke yang bersangkutan, catatan ini hilang saat halaman dimuat ulang.
+        </div>
+      )}
+
+      <div className="sj-panel-head sj-mt"><h2>Akun terdaftar</h2></div>
+      {memuat && <p className="sj-bantuan">Memuat akun…</p>}
+
+      {!memuat && !!akun.length && (
+        <div className="sj-tabel">
+          <div className="sj-thead sj-row4"><span>Nama</span><span>Peran</span><span>Aktivitas</span><span>Tindakan</span></div>
+          {akun.map((a) => (
+            <div key={a.id} className="sj-trow sj-row4 sj-statis">
+              <span className="sj-td"><strong>{a.nama}</strong><span className="sj-row-meta">{a.nip}</span></span>
+              <span className="sj-td">
+                <span className={`sj-badge ${a.peran === "admin" ? "sj-badge-biru" : "sj-badge-netral"}`}>
+                  {a.peran === "admin" ? "Admin" : "Pegawai"}
+                </span>
+              </span>
+              <span className="sj-td sj-row-meta">
+                dibuat {tglSingkat(new Date(a.dibuat).toISOString().slice(0, 10))}
+                <span>masuk terakhir {waktuRelatif(a.terakhirMasuk)}</span>
+              </span>
+              <span className="sj-td sj-td-aksi">
+                {a.id === sesi.id ? <span className="sj-row-meta">akun Anda</span> : (
+                  <>
+                    <button className="sj-btn sj-btn-teks" onClick={() => reset(a)}>Setel ulang sandi</button>
+                    <button className="sj-btn sj-btn-teks" onClick={() => onUbahPeran(a.id, a.peran === "admin" ? "pegawai" : "admin")}>
+                      Jadikan {a.peran === "admin" ? "pegawai" : "admin"}
+                    </button>
+                    <button className="sj-btn sj-btn-teks sj-hapus" onClick={() => onHapus(a.id)}>Hapus</button>
+                  </>
+                )}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+/* ============================================================
+   Admin — log aktivitas
+   ============================================================ */
+
+function LogAdmin({ log, memuat, onSegarkan }) {
+  return (
+    <>
+      <div className="sj-panel-head">
+        <h2>Log aktivitas</h2>
+        <button className="sj-btn sj-btn-teks" onClick={onSegarkan}>Muat ulang</button>
+      </div>
+      <p className="sj-bantuan">Catatan 300 kejadian terakhir: siapa masuk, siapa mengubah status berkas, dan siapa menyentuh akun.</p>
+      {memuat && <p className="sj-bantuan">Memuat log…</p>}
+      {!memuat && !log.length && <p className="sj-bantuan">Belum ada aktivitas yang tercatat.</p>}
+      {!!log.length && (
+        <div className="sj-tabel sj-mt">
+          <div className="sj-thead sj-row3"><span>Waktu</span><span>Pelaku</span><span>Kegiatan</span></div>
+          {log.map((l, i) => (
+            <div key={i} className="sj-trow sj-row3 sj-statis">
+              <span className="sj-td sj-row-meta">{jamTanggal(l.ts)}</span>
+              <span className="sj-td">{l.aktor}</span>
+              <span className="sj-td">{l.aksi}<span className="sj-row-meta">{l.rincian}</span></span>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+/* ============================================================
+   Ubah kata sandi
+   ============================================================ */
+
+function UbahSandi({ sesi, wajib, onTutup, onSimpan }) {
+  const [lama, setLama] = useState("");
+  const [baru, setBaru] = useState("");
+  const [ulangi, setUlangi] = useState("");
+  const [galat, setGalat] = useState("");
+  const [sibuk, setSibuk] = useState(false);
+
+  async function kirim() {
+    setGalat("");
+    const pesan = periksaSandi(baru);
+    if (pesan) return setGalat(pesan);
+    if (baru !== ulangi) return setGalat("Ulangan kata sandi belum sama.");
+    if (baru === lama) return setGalat("Kata sandi baru harus berbeda dari yang lama.");
+    setSibuk(true);
+    const hasil = await onSimpan(lama, baru);
+    setSibuk(false);
+    if (hasil !== true) setGalat(hasil || "Kata sandi gagal diganti.");
+  }
+
+  return (
+    <div className="sj-tirai" onClick={wajib ? undefined : onTutup}>
+      <div className="sj-laci sj-laci-kecil" onClick={(e) => e.stopPropagation()}>
+        <div className="sj-laci-head">
+          <div>
+            <h2>Ubah kata sandi</h2>
+            <p className="sj-row-meta">{sesi.nama} · {sesi.nip}</p>
+          </div>
+          {!wajib && <button className="sj-btn sj-btn-teks" onClick={onTutup}>Tutup</button>}
+        </div>
+        {wajib && <p className="sj-info sj-mt">Akun ini dibuatkan oleh admin. Ganti kata sandinya dulu sebelum melanjutkan.</p>}
+        <div className="sj-mt">
+          <label className="sj-field"><span>Kata sandi sekarang</span>
+            <input type="password" value={lama} onChange={(e) => setLama(e.target.value)} /></label>
+          <label className="sj-field"><span>Kata sandi baru</span>
+            <input type="password" value={baru} onChange={(e) => setBaru(e.target.value)} />
+            <KekuatanSandi sandi={baru} /></label>
+          <label className="sj-field"><span>Ulangi kata sandi baru</span>
+            <input type="password" value={ulangi} onChange={(e) => setUlangi(e.target.value)} /></label>
+        </div>
+        {galat && <div className="sj-galat">{galat}</div>}
+        <div className="sj-aksi">
+          <button className="sj-btn sj-btn-utama" onClick={kirim} disabled={sibuk}>
+            {sibuk ? "Menyimpan…" : "Simpan kata sandi"}
+          </button>
+          {!wajib && <button className="sj-btn sj-btn-halus" onClick={onTutup}>Batal</button>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   Detail pengajuan
+   ============================================================ */
+
+function DetailPengajuan({ data, peran, onTutup, onUbahStatus, onHapus }) {
+  const [foto, setFoto] = useState(null);
+  const [statusFoto, setStatusFoto] = useState("memuat");
+  const [catatan, setCatatan] = useState(data.catatanAdmin || "");
+  const [zoom, setZoom] = useState(false);
+
+  useEffect(() => {
+    let hidup = true;
+    (async () => {
+      try {
+        const r = await window.storage.get(fotoKey(data.id), true);
+        if (!hidup) return;
+        if (r && r.value) { setFoto(await bukaSandi(r.value)); setStatusFoto("ada"); }
+        else setStatusFoto("kosong");
+      } catch { if (hidup) setStatusFoto("kosong"); }
+    })();
+    return () => { hidup = false; };
+  }, [data.id]);
+
+  useEffect(() => {
+    const esc = (e) => e.key === "Escape" && (zoom ? setZoom(false) : onTutup());
+    window.addEventListener("keydown", esc);
+    return () => window.removeEventListener("keydown", esc);
+  }, [onTutup, zoom]);
+
+  const selisih = (data.gajiBaru || 0) - (data.gajiLama || 0);
+
+  return (
+    <div className="sj-tirai" onClick={onTutup}>
+      <div className="sj-laci" onClick={(e) => e.stopPropagation()}>
+        <div className="sj-laci-head">
+          <div>
+            <h2>{data.nama}</h2>
+            <p className="sj-row-meta">{data.nip} · dikirim {waktuRelatif(data.dibuat)}</p>
+          </div>
+          <button className="sj-btn sj-btn-teks" onClick={onTutup}>Tutup</button>
+        </div>
+
+        <div className="sj-laci-status"><Lencana status={data.status} /></div>
+
+        <div className="sj-lampiran">
+          {statusFoto === "memuat" && <div className="sj-lampiran-kosong">Membuka lampiran…</div>}
+          {statusFoto === "kosong" && <div className="sj-lampiran-kosong">Lampiran tidak ditemukan pada berkas ini.</div>}
+          {statusFoto === "ada" && (
+            <button className="sj-lampiran-img" onClick={() => setZoom(true)} title="Klik untuk memperbesar">
+              <img src={foto} alt={`Lampiran SK ${data.nama}`} />
+            </button>
+          )}
+          {data.namaFoto && <div className="sj-bantuan">{data.namaFoto}</div>}
+        </div>
+
+        <Baris label="Pangkat / golongan">{data.pangkat} · {data.golongan}</Baris>
+        <Baris label="Jabatan">{data.jabatan || "—"}</Baris>
+        <Baris label="Unit kerja">{data.unit}</Baris>
+        <Baris label="Masa kerja golongan">{data.masaKerja}</Baris>
+        <Baris label="Nomor SK terakhir">{data.noSk || "—"}</Baris>
+        <Baris label="TMT berkala terakhir">{tglIndo(data.tmtLama)}</Baris>
+        <Baris label="TMT berkala berikutnya">{tglIndo(data.tmtBaru)}</Baris>
+        <Baris label="Gaji pokok saat ini">{rupiah(data.gajiLama)}</Baris>
+        <Baris label="Gaji pokok usulan">
+          {rupiah(data.gajiBaru)} {selisih > 0 && <span className="sj-hijau">(+{rupiah(selisih)})</span>}
+        </Baris>
+        {data.catatan && <Baris label="Catatan pegawai">{data.catatan}</Baris>}
+        {data.catatanAdmin && peran === "pegawai" && <Baris label="Catatan kepegawaian">{data.catatanAdmin}</Baris>}
+
+        {peran === "admin" && (
+          <div className="sj-verifikasi">
+            <label className="sj-field"><span>Catatan untuk pegawai</span>
+              <textarea rows={2} value={catatan} onChange={(e) => setCatatan(e.target.value)}
+                placeholder="Contoh: lampirkan juga SK pangkat terakhir." /></label>
+            <div className="sj-aksi">
+              <button className="sj-btn sj-btn-setuju" onClick={() => onUbahStatus("disetujui", bersihkan(catatan, 300))}>Setujui</button>
+              <button className="sj-btn sj-btn-halus" onClick={() => onUbahStatus("perbaikan", bersihkan(catatan, 300))}>Minta perbaikan</button>
+              <button className="sj-btn sj-btn-tolak" onClick={() => onUbahStatus("ditolak", bersihkan(catatan, 300))}>Tolak</button>
+            </div>
+            <button className="sj-btn sj-btn-teks sj-hapus" onClick={onHapus}>Hapus berkas ini</button>
+          </div>
+        )}
+      </div>
+
+      {zoom && (
+        <div className="sj-zoom" onClick={(e) => { e.stopPropagation(); setZoom(false); }}>
+          <img src={foto} alt={`Lampiran SK ${data.nama} diperbesar`} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+   Akar aplikasi
+   ============================================================ */
+
+export default function Simoji() {
+  const [sesi, setSesi] = useState(null);
+  const [siapSesi, setSiapSesi] = useState(false);
+  const [daftar, setDaftar] = useState([]);
+  const [akun, setAkun] = useState([]);
+  const [log, setLog] = useState([]);
+  const [memuat, setMemuat] = useState(true);
+  const [tab, setTab] = useState("beranda");
+  const [ubahSandi, setUbahSandi] = useState(false);
+  const [kabar, setKabar] = useState("");
+
+  const wajibGanti = !!(sesi && sesi.wajibGanti);
+
+  const muat = useCallback(async (peran) => {
+    setMemuat(true);
+    const d = await ambilDaftar();
+    d.sort((a, b) => (b.dibuat || 0) - (a.dibuat || 0));
+    setDaftar(d);
+    if (peran === "admin") {
+      const a = await ambilAkun();
+      a.sort((x, y) => (y.dibuat || 0) - (x.dibuat || 0));
+      setAkun(a);
+      setLog(await ambilLog());
+    }
+    setMemuat(false);
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await window.storage.get(KEY_SESI, false);
+        if (r && r.value) {
+          const s = JSON.parse(r.value);
+          if (s.kedaluwarsa > Date.now()) {
+            const semua = await ambilAkun();
+            const masih = semua.find((a) => a.id === s.id);
+            if (masih) setSesi(masih);
+          } else {
+            await window.storage.delete(KEY_SESI, false);
+          }
+        }
+      } catch { /* belum pernah masuk */ }
+      setSiapSesi(true);
+    })();
+  }, []);
+
+  useEffect(() => { if (sesi) muat(sesi.peran); }, [sesi, muat]);
+
+  useEffect(() => {
+    if (!sesi || sesi.peran !== "admin") return;
+    const t = setInterval(() => muat("admin"), 20000);
+    return () => clearInterval(t);
+  }, [sesi, muat]);
+
+  useEffect(() => {
+    if (!kabar) return;
+    const t = setTimeout(() => setKabar(""), 3800);
+    return () => clearTimeout(t);
+  }, [kabar]);
+
+  useEffect(() => { if (wajibGanti) setUbahSandi(true); }, [wajibGanti]);
+
+  async function masuk(a) {
+    setSesi(a);
+    setTab("beranda");
+    try {
+      await window.storage.set(KEY_SESI, JSON.stringify({
+        id: a.id, kedaluwarsa: Date.now() + SESI_JAM * 3600000,
+      }), false);
+    } catch { /* sesi tidak wajib tersimpan */ }
+  }
+
+  async function keluar() {
+    if (sesi) await catat(sesi.nama, "Keluar", "");
+    setSesi(null); setDaftar([]); setAkun([]); setLog([]);
+    try { await window.storage.delete(KEY_SESI, false); } catch { /* tidak penting */ }
+  }
+
+  async function simpanProfil(nama, profil) {
+    try {
+      const semua = await ambilAkun();
+      const baru = semua.map((a) => a.id === sesi.id ? { ...a, nama, profil } : a);
+      await simpanAkun(baru);
+      setSesi((s) => ({ ...s, nama, profil }));
+      await catat(nama, "Perbarui profil", "");
+      return true;
+    } catch { return "Profil gagal disimpan. Coba lagi."; }
+  }
+
+  async function buatAkun({ nama, nip, sandi, peran }) {
+    try {
+      const semua = await ambilAkun();
+      if (semua.some((a) => a.nip === nip)) return "NIP ini sudah punya akun.";
+      const garam = garamBaru();
+      const baru = {
+        id: uid(), nip, nama, peran, garam, iterasi: ITERASI,
+        hash: await turunkanSandi(sandi, garam),
+        profil: {}, wajibGanti: true, dibuat: Date.now(), terakhirMasuk: 0,
+      };
+      const semuaBaru = [baru, ...semua];
+      await simpanAkun(semuaBaru);
+      setAkun(semuaBaru.slice().sort((x, y) => (y.dibuat || 0) - (x.dibuat || 0)));
+      await catat(sesi.nama, "Buat akun", `${nama} sebagai ${peran}`);
+      setKabar(`Akun ${peran} untuk ${nama} dibuat.`);
+      return true;
+    } catch { return "Akun gagal disimpan. Coba lagi."; }
+  }
+
+  async function resetSandi(id, sandiBaru) {
+    try {
+      const semua = await ambilAkun();
+      const sasaran = semua.find((a) => a.id === id);
+      if (!sasaran) return "Akun tidak ditemukan.";
+      const garam = garamBaru();
+      const baru = semua.map((a) => a.id === id
+        ? { ...a, garam, iterasi: ITERASI, hash: null, wajibGanti: true }
+        : a);
+      const idx = baru.findIndex((a) => a.id === id);
+      baru[idx].hash = await turunkanSandi(sandiBaru, garam);
+      await simpanAkun(baru);
+      setAkun(baru.slice().sort((x, y) => (y.dibuat || 0) - (x.dibuat || 0)));
+      await catat(sesi.nama, "Setel ulang sandi", sasaran.nama);
+      return true;
+    } catch { return "Kata sandi gagal disetel ulang."; }
+  }
+
+  async function hapusAkun(id) {
+    const asli = akun;
+    const sasaran = akun.find((a) => a.id === id);
+    setAkun((p) => p.filter((a) => a.id !== id));
+    try {
+      const semua = await ambilAkun();
+      await simpanAkun(semua.filter((a) => a.id !== id));
+      await catat(sesi.nama, "Hapus akun", sasaran ? sasaran.nama : "");
+      setKabar("Akun dihapus. Berkas yang pernah dikirim tetap tersimpan.");
+    } catch {
+      setAkun(asli);
+      setKabar("Akun gagal dihapus. Coba lagi.");
+    }
+  }
+
+  async function ubahPeran(id, peran) {
+    const asli = akun;
+    setAkun((p) => p.map((a) => a.id === id ? { ...a, peran } : a));
+    try {
+      const semua = await ambilAkun();
+      await simpanAkun(semua.map((a) => a.id === id ? { ...a, peran } : a));
+      const s = semua.find((a) => a.id === id);
+      await catat(sesi.nama, "Ubah peran", `${s ? s.nama : ""} menjadi ${peran}`);
+      setKabar(`Peran akun diubah menjadi ${peran}.`);
+    } catch {
+      setAkun(asli);
+      setKabar("Peran gagal diubah. Coba lagi.");
+    }
+  }
+
+  async function gantiSandi(lama, baru) {
+    try {
+      const semua = await ambilAkun();
+      const saya = semua.find((a) => a.id === sesi.id);
+      if (!saya) return "Akun Anda tidak ditemukan lagi.";
+      const cek = await turunkanSandi(lama, saya.garam, saya.iterasi || ITERASI);
+      if (!samaAman(cek, saya.hash)) return "Kata sandi sekarang salah.";
+      const garam = garamBaru();
+      const hash = await turunkanSandi(baru, garam);
+      await simpanAkun(semua.map((a) => a.id === sesi.id
+        ? { ...a, garam, iterasi: ITERASI, hash, wajibGanti: false } : a));
+      setSesi((s) => ({ ...s, wajibGanti: false }));
+      setUbahSandi(false);
+      await catat(sesi.nama, "Ganti kata sandi", "");
+      setKabar("Kata sandi diganti.");
+      return true;
+    } catch { return "Kata sandi gagal diganti. Coba lagi."; }
+  }
+
+  async function ubahStatus(id, status, catatanAdmin) {
+    const asli = daftar;
+    const ubah = (d) => d.id === id ? { ...d, status, catatanAdmin, diperbarui: Date.now() } : d;
+    setDaftar((p) => p.map(ubah));
+    try {
+      const server = await ambilDaftar();
+      const sasaran = server.find((d) => d.id === id);
+      await simpanDaftar(server.map(ubah));
+      await catat(sesi.nama, "Ubah status berkas", `${sasaran ? sasaran.nama : ""} → ${STATUS[status].label}`);
+      setKabar(`Berkas ditandai ${STATUS[status].label.toLowerCase()}.`);
+    } catch {
+      setDaftar(asli);
+      setKabar("Perubahan gagal disimpan. Coba lagi.");
+    }
+  }
+
+  async function hapusBerkas(id) {
+    const asli = daftar;
+    const sasaran = daftar.find((d) => d.id === id);
+    setDaftar((p) => p.filter((d) => d.id !== id));
+    try {
+      const server = await ambilDaftar();
+      await simpanDaftar(server.filter((d) => d.id !== id));
+      try { await window.storage.delete(fotoKey(id), true); } catch { /* lampiran sudah hilang */ }
+      await catat(sesi.nama, "Hapus berkas", sasaran ? sasaran.nama : "");
+      setKabar("Berkas dihapus.");
+    } catch {
+      setDaftar(asli);
+      setKabar("Berkas gagal dihapus. Coba lagi.");
+    }
+  }
+
+  if (!siapSesi) return <div className="sj-app"><style>{CSS}</style><div className="sj-muat">Menyiapkan Simoji…</div></div>;
+  if (!sesi) return <div className="sj-app"><style>{CSS}</style><LayarMasuk onMasuk={masuk} /></div>;
+
+  const menu = sesi.peran === "admin"
+    ? [["beranda", "Berkas pengajuan"], ["akun", "Akun pengguna"], ["log", "Log aktivitas"]]
+    : [["beranda", "Beranda"], ["ajukan", "Pengajuan baru"], ["profil", "Profil"]];
+
+  return (
+    <div className="sj-app">
+      <style>{CSS}</style>
+
+      <header className="sj-bar">
+        <div className="sj-bar-kiri">
+          <div className="sj-lambang sj-lambang-kecil"><span /><span /><span /></div>
+          <div>
+            <div className="sj-bar-nama">Simoji</div>
+            <div className="sj-bar-sub">{sesi.peran === "admin" ? "Panel kepegawaian" : "Panel pegawai"}</div>
+          </div>
+        </div>
+        <div className="sj-bar-kanan">
+          <span className="sj-pengguna">{sesi.nama}<span className="sj-bar-nip"> · {sesi.nip}</span></span>
+          <button className="sj-btn sj-btn-teks" onClick={() => setUbahSandi(true)}>Ubah sandi</button>
+          <button className="sj-btn sj-btn-teks" onClick={keluar}>Keluar</button>
+        </div>
+      </header>
+
+      <nav className="sj-nav">
+        {menu.map(([k, label]) => (
+          <button key={k} className={`sj-navbtn ${tab === k ? "aktif" : ""}`} onClick={() => setTab(k)}>{label}</button>
+        ))}
+      </nav>
+
+      {kabar && <div className="sj-kabar">{kabar}</div>}
+
+      <main className="sj-isi">
+        {sesi.peran === "admin" ? (
+          tab === "akun" ? (
+            <AkunAdmin sesi={sesi} akun={akun} memuat={memuat}
+              onBuat={buatAkun} onHapus={hapusAkun} onUbahPeran={ubahPeran} onReset={resetSandi} />
+          ) : tab === "log" ? (
+            <LogAdmin log={log} memuat={memuat} onSegarkan={() => muat("admin")} />
+          ) : (
+            <BerkasAdmin daftar={daftar} memuat={memuat} onSegarkan={() => muat("admin")}
+              onUbahStatus={ubahStatus} onHapus={hapusBerkas} />
+          )
+        ) : tab === "ajukan" ? (
+          <FormPengajuan sesi={sesi} onBatal={() => setTab("beranda")}
+            onSelesai={(r) => { setDaftar((p) => [r, ...p]); setTab("beranda"); setKabar("Pengajuan terkirim dan sudah masuk ke daftar admin."); }} />
+        ) : tab === "profil" ? (
+          <ProfilPegawai sesi={sesi} onSimpan={simpanProfil} />
+        ) : (
+          <BerandaPegawai sesi={sesi} daftar={daftar} memuat={memuat}
+            onAjukan={() => setTab("ajukan")} onSegarkan={() => muat(sesi.peran)} />
+        )}
+      </main>
+
+      {ubahSandi && (
+        <UbahSandi sesi={sesi} wajib={wajibGanti} onTutup={() => setUbahSandi(false)} onSimpan={gantiSandi} />
+      )}
+
+      <footer className="sj-kaki">
+        <span>Kenaikan gaji berkala dihitung setiap dua tahun sejak TMT terakhir. Pengajuan sebaiknya dikirim dua bulan sebelum jatuh tempo.</span>
+        <span className="sj-row-meta">Sesi berakhir otomatis setelah {SESI_JAM} jam.</span>
+      </footer>
+    </div>
+  );
+}
+
+/* ============================================================
+   Gaya
+   ============================================================ */
+
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=Archivo+Narrow:wght@400;500;600&display=swap');
+
+.sj-app{
+  --biru-tua:#0A3355;
+  --biru:#125881;
+  --biru-muda:#4A8FB8;
+  --hijau-tua:#0C5A44;
+  --hijau:#127A5C;
+  --hijau-muda:#37A57C;
+  --tinta:#12303C;
+  --tinta-lembut:#4F6B76;
+  --garis:#BBD1CB;
+  --garis-tipis:#D3E2DD;
+  --kertas:#FBFDFC;
+  --amber:#95610B;
+  --rust:#8C3520;
+  font-family:'Archivo','Segoe UI',system-ui,sans-serif;
+  color:var(--tinta);
+  min-height:100vh;
+  font-size:15px;line-height:1.5;
+  background:linear-gradient(160deg,#DCEDE5 0%,#DFEDEF 50%,#DAE8F4 100%);
+  background-attachment:fixed;
+  -webkit-font-smoothing:antialiased;
+}
+.sj-app *{box-sizing:border-box;}
+.sj-app button:focus-visible,.sj-app input:focus-visible,
+.sj-app select:focus-visible,.sj-app textarea:focus-visible{outline:2px solid var(--biru);outline-offset:2px;}
+.sj-muat{padding:80px 24px;text-align:center;color:var(--tinta-lembut);}
+
+.sj-lambang{display:flex;gap:4px;align-items:flex-end;height:32px;}
+.sj-lambang span{display:block;width:6px;background:var(--biru-tua);}
+.sj-lambang span:nth-child(1){height:32px;}
+.sj-lambang span:nth-child(2){height:20px;background:var(--hijau-muda);}
+.sj-lambang span:nth-child(3){height:26px;background:var(--hijau-tua);}
+.sj-lambang-kecil{height:22px;gap:3px;}
+.sj-lambang-kecil span{width:4px;background:#fff;}
+.sj-lambang-kecil span:nth-child(1){height:22px;}
+.sj-lambang-kecil span:nth-child(2){height:13px;background:#7FD6B4;}
+.sj-lambang-kecil span:nth-child(3){height:18px;background:#B7E2D4;}
+
+/* masuk */
+.sj-masuk{display:grid;grid-template-columns:1.05fr 1fr;min-height:100vh;}
+.sj-masuk-kiri{background:linear-gradient(155deg,#0A3355 0%,#125881 50%,#0C5A44 100%);color:#E9F5F0;padding:52px 46px;display:flex;flex-direction:column;gap:10px;justify-content:center;}
+.sj-brand{font-size:50px;font-weight:700;letter-spacing:-0.03em;margin:10px 0 0;}
+.sj-brand-sub{font-family:'Archivo Narrow',sans-serif;font-size:17px;color:#A6CADB;margin:0;}
+.sj-masuk-teks{max-width:40ch;color:#CDE5DC;margin:16px 0 0;}
+.sj-masuk-daftar{max-width:42ch;margin:22px 0 0;padding:16px 0 0 18px;border-top:1px solid rgba(255,255,255,.22);color:#A8C7C6;font-size:13px;line-height:1.7;}
+.sj-masuk-kanan{padding:52px 46px;display:flex;flex-direction:column;gap:16px;justify-content:center;max-width:560px;background:rgba(255,255,255,.62);}
+.sj-tabs{display:flex;border-bottom:1px solid var(--garis);}
+.sj-tab{background:none;border:none;border-bottom:2px solid transparent;padding:10px 2px;margin-right:26px;font:inherit;color:var(--tinta-lembut);cursor:pointer;}
+.sj-tab.aktif{color:var(--biru-tua);border-bottom-color:var(--hijau);font-weight:600;}
+
+.sj-segmen{display:grid;grid-template-columns:1fr 1fr;border:1px solid var(--garis);border-radius:2px;overflow:hidden;background:#fff;}
+.sj-segmen button{padding:11px 10px;background:none;border:none;font:inherit;font-size:14px;color:var(--tinta-lembut);cursor:pointer;}
+.sj-segmen button + button{border-left:1px solid var(--garis);}
+.sj-segmen button.aktif{background:var(--biru-tua);color:#EAF5F1;font-weight:600;}
+
+/* bilah */
+.sj-bar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 28px;background:var(--biru-tua);border-bottom:3px solid var(--hijau);color:#E9F5F0;flex-wrap:wrap;}
+.sj-bar-kiri{display:flex;align-items:center;gap:12px;}
+.sj-bar-nama{font-weight:700;font-size:20px;letter-spacing:-0.02em;line-height:1.1;}
+.sj-bar-sub{font-family:'Archivo Narrow',sans-serif;font-size:13px;color:#A6CADB;}
+.sj-bar-kanan{display:flex;align-items:center;gap:16px;}
+.sj-pengguna{font-size:14px;}
+.sj-bar-nip{font-family:'Archivo Narrow',sans-serif;color:#A6CADB;}
+.sj-bar .sj-btn-teks{color:#C4E5D9;}
+.sj-bar .sj-btn-teks:hover{color:#fff;}
+
+.sj-nav{display:flex;background:rgba(255,255,255,.72);border-bottom:1px solid var(--garis);padding:0 28px;overflow-x:auto;}
+.sj-navbtn{background:none;border:none;border-bottom:3px solid transparent;padding:12px 4px;margin-right:26px;font:inherit;color:var(--tinta-lembut);cursor:pointer;white-space:nowrap;}
+.sj-navbtn.aktif{color:var(--biru-tua);border-bottom-color:var(--hijau);font-weight:600;}
+.sj-kabar{padding:10px 28px;background:var(--hijau-tua);color:#EAF6F1;font-size:14px;}
+
+.sj-isi{padding:26px 28px;max-width:1120px;margin:0 auto;}
+.sj-kaki{padding:20px 28px 40px;max-width:1120px;margin:0 auto;color:var(--tinta-lembut);font-size:13px;border-top:1px solid var(--garis);display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;}
+
+/* penggaris */
+.sj-ruler{padding:24px 0 18px;border-bottom:1px solid var(--garis);}
+.sj-ruler-head{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;flex-wrap:wrap;margin-bottom:22px;}
+.sj-ruler-num{font-size:60px;font-weight:700;letter-spacing:-0.04em;line-height:1;color:var(--biru-tua);}
+.sj-ruler-unit{font-size:19px;font-weight:500;letter-spacing:0;color:var(--tinta-lembut);margin-left:8px;}
+.sj-ruler-sub{color:var(--tinta-lembut);margin-top:4px;}
+.sj-ruler-tgl{text-align:right;}
+.sj-ruler-tgl-v{font-family:'Archivo Narrow',sans-serif;font-size:20px;font-weight:600;color:var(--hijau-tua);}
+.sj-ruler-track{position:relative;height:30px;border-bottom:2px solid var(--biru-tua);}
+.sj-ruler-fill{position:absolute;left:0;top:0;bottom:0;background:rgba(55,165,124,.24);transition:width .5s ease;}
+.sj-ruler-ticks{position:absolute;inset:0;display:flex;justify-content:space-between;align-items:flex-end;}
+.sj-tick{width:1px;height:8px;background:var(--garis);}
+.sj-tick-mayor{height:16px;background:var(--tinta-lembut);}
+.sj-ruler-mark{position:absolute;bottom:-6px;width:2px;height:36px;background:var(--biru);transition:left .5s ease;}
+.sj-ruler-mark::after{content:"";position:absolute;top:-7px;left:-4px;width:10px;height:10px;background:var(--biru);border-radius:50%;}
+.sj-ruler-foot{display:flex;justify-content:space-between;margin-top:8px;font-family:'Archivo Narrow',sans-serif;font-size:12px;color:var(--tinta-lembut);}
+
+/* statistik */
+.sj-statbar{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--garis);background:rgba(255,255,255,.62);}
+.sj-statbar-2{grid-template-columns:repeat(2,1fr);}
+.sj-stat{padding:18px 20px;border-right:1px solid var(--garis);}
+.sj-stat:last-child{border-right:none;}
+.sj-stat-n{font-size:36px;font-weight:700;letter-spacing:-0.03em;line-height:1;color:var(--biru-tua);}
+.sj-stat-l{font-family:'Archivo Narrow',sans-serif;color:var(--tinta-lembut);margin-top:6px;font-size:14px;}
+.sj-amber{color:var(--amber);}
+.sj-hijau{color:var(--hijau);}
+.sj-biru{color:var(--biru);}
+
+/* perkakas */
+.sj-toolbar{display:flex;justify-content:space-between;gap:16px;align-items:center;padding:18px 0;flex-wrap:wrap;}
+.sj-chips{display:flex;gap:8px;flex-wrap:wrap;}
+.sj-chip{background:rgba(255,255,255,.7);border:1px solid var(--garis);border-radius:2px;padding:6px 12px;font:inherit;font-size:13px;color:var(--tinta-lembut);cursor:pointer;}
+.sj-chip.aktif{background:var(--biru-tua);color:#EAF6F1;border-color:var(--biru-tua);}
+.sj-cari{border:1px solid var(--garis);border-radius:2px;padding:8px 12px;font:inherit;font-size:14px;background:#fff;min-width:250px;color:var(--tinta);}
+.sj-aksi-kanan{display:flex;align-items:center;gap:12px;flex-wrap:wrap;}
+
+/* tabel */
+.sj-tabel{border:1px solid var(--garis);background:rgba(255,255,255,.66);}
+.sj-thead{display:grid;gap:16px;padding:9px 14px;background:rgba(10,51,85,.06);border-bottom:1px solid var(--garis);font-family:'Archivo Narrow',sans-serif;font-size:13px;color:var(--tinta-lembut);}
+.sj-trow{display:grid;gap:16px;align-items:center;width:100%;text-align:left;background:none;border:none;border-bottom:1px solid var(--garis-tipis);padding:12px 14px;font:inherit;color:inherit;cursor:pointer;}
+.sj-trow:last-child{border-bottom:none;}
+.sj-trow:hover{background:#fff;}
+.sj-statis{cursor:default;}
+.sj-statis:hover{background:none;}
+.sj-row3{grid-template-columns:1.4fr 1fr auto;}
+.sj-row4{grid-template-columns:1.4fr .7fr 1fr auto;}
+.sj-row5{grid-template-columns:1.5fr .9fr 1fr 1fr auto;}
+.sj-td{display:flex;flex-direction:column;min-width:0;}
+.sj-td strong{font-weight:600;}
+.sj-td-num{font-variant-numeric:tabular-nums;}
+.sj-td-status{align-items:flex-end;}
+.sj-td-aksi{flex-direction:row;gap:14px;align-items:center;flex-wrap:wrap;justify-content:flex-end;}
+.sj-row-meta{font-family:'Archivo Narrow',sans-serif;font-size:13px;color:var(--tinta-lembut);display:block;}
+
+/* lencana */
+.sj-badge{display:inline-block;font-family:'Archivo Narrow',sans-serif;font-size:13px;padding:3px 9px;border:1px solid;border-radius:2px;white-space:nowrap;}
+.sj-badge-biru{color:var(--biru);border-color:var(--biru-muda);background:rgba(74,143,184,.12);}
+.sj-badge-hijau{color:var(--hijau-tua);border-color:var(--hijau);background:rgba(18,122,92,.12);}
+.sj-badge-amber{color:var(--amber);border-color:var(--amber);background:rgba(149,97,11,.1);}
+.sj-badge-rust{color:var(--rust);border-color:var(--rust);background:rgba(140,53,32,.1);}
+.sj-badge-netral{color:var(--tinta-lembut);border-color:var(--garis);background:#fff;}
+
+/* panel & formulir */
+.sj-panel{background:rgba(255,255,255,.76);border:1px solid var(--garis);border-radius:2px;padding:24px;}
+.sj-panel-head{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:16px;flex-wrap:wrap;}
+.sj-panel-head h2{font-size:23px;font-weight:600;letter-spacing:-0.02em;margin:0;color:var(--biru-tua);}
+.sj-mt{margin-top:26px;}
+.sj-sub{font-family:'Archivo Narrow',sans-serif;font-size:15px;color:var(--hijau-tua);border-bottom:1px solid var(--garis);padding-bottom:6px;margin:22px 0 14px;}
+.sj-grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px 18px;}
+.sj-field{display:flex;flex-direction:column;gap:5px;margin-bottom:12px;}
+.sj-field > span{font-family:'Archivo Narrow',sans-serif;font-size:14px;color:var(--tinta-lembut);}
+.sj-field input,.sj-field select,.sj-field textarea{border:1px solid var(--garis);border-radius:2px;padding:9px 11px;font:inherit;font-size:15px;background:#fff;color:var(--tinta);width:100%;}
+.sj-field textarea{resize:vertical;}
+.sj-gabung{display:flex;gap:8px;}
+.sj-gabung .sj-btn{white-space:nowrap;padding:8px 14px;}
+.sj-bantuan{font-size:13px;color:var(--tinta-lembut);margin:4px 0 0;}
+.sj-bantuan code,.sj-info code{background:var(--kertas);padding:1px 5px;border:1px solid var(--garis);font-family:'Archivo Narrow',sans-serif;}
+.sj-galat{border-left:3px solid var(--rust);background:rgba(140,53,32,.08);color:var(--rust);padding:9px 12px;font-size:14px;margin:12px 0;}
+.sj-info{border-left:3px solid var(--hijau);background:rgba(18,122,92,.09);color:var(--hijau-tua);padding:9px 12px;font-size:14px;margin:12px 0;}
+.sj-form{display:flex;flex-direction:column;}
+
+.sj-kekuatan{display:flex;align-items:center;gap:10px;margin-top:6px;}
+.sj-kekuatan-bar{display:flex;gap:4px;}
+.sj-kekuatan-bar span{width:34px;height:4px;background:var(--garis);border-radius:2px;}
+.sj-kekuatan-bar span.terisi{background:var(--amber);}
+.sj-kekuatan-bar span.terisi.t3{background:var(--hijau);}
+.sj-kekuatan-bar span.terisi.t4{background:var(--hijau-tua);}
+
+/* unggah */
+.sj-unggah{margin-bottom:14px;}
+.sj-drop{width:100%;display:flex;flex-direction:column;gap:4px;align-items:flex-start;text-align:left;padding:20px;background:var(--kertas);border:1px dashed var(--hijau);border-radius:2px;font:inherit;color:var(--tinta);cursor:pointer;}
+.sj-drop span{font-size:13px;color:var(--tinta-lembut);}
+.sj-pratinjau{display:flex;gap:16px;align-items:flex-start;}
+.sj-pratinjau img{width:150px;height:110px;object-fit:cover;border:1px solid var(--garis);}
+.sj-pratinjau-nama{font-family:'Archivo Narrow',sans-serif;font-weight:600;}
+
+/* tombol */
+.sj-btn{font:inherit;border-radius:2px;cursor:pointer;padding:10px 18px;border:1px solid transparent;}
+.sj-btn:disabled{opacity:.5;cursor:not-allowed;}
+.sj-btn-utama{background:var(--biru-tua);color:#EAF5F1;}
+.sj-btn-utama:hover:not(:disabled){background:#082944;}
+.sj-btn-halus{background:#fff;color:var(--biru-tua);border-color:var(--biru-tua);}
+.sj-btn-setuju{background:var(--hijau);color:#fff;}
+.sj-btn-setuju:hover{background:var(--hijau-tua);}
+.sj-btn-tolak{background:none;color:var(--rust);border-color:var(--rust);}
+.sj-btn-teks{background:none;color:var(--biru);border:none;padding:6px 2px;text-decoration:underline;text-underline-offset:3px;}
+.sj-btn-teks:hover{color:var(--biru-tua);}
+.sj-aksi{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px;}
+.sj-hapus{color:var(--rust);}
+
+.sj-kosong{padding:40px 0 32px;border-bottom:1px solid var(--garis);max-width:52ch;}
+.sj-kosong h2{font-size:27px;font-weight:600;letter-spacing:-0.02em;margin:0 0 8px;color:var(--biru-tua);}
+.sj-kosong p{color:var(--tinta-lembut);margin:0 0 18px;}
+
+/* laci */
+.sj-tirai{position:fixed;inset:0;background:rgba(10,51,85,.5);display:flex;justify-content:flex-end;z-index:40;}
+.sj-laci{width:min(560px,100%);background:var(--kertas);height:100%;overflow-y:auto;padding:24px 26px 40px;border-left:4px solid var(--hijau);animation:sj-geser .2s ease-out;}
+.sj-laci-kecil{width:min(440px,100%);}
+@keyframes sj-geser{from{transform:translateX(26px);opacity:.4}to{transform:none;opacity:1}}
+@media (prefers-reduced-motion:reduce){.sj-laci{animation:none}.sj-ruler-fill,.sj-ruler-mark{transition:none}}
+.sj-laci-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;padding-bottom:14px;border-bottom:1px solid var(--garis);}
+.sj-laci-head h2{font-size:22px;font-weight:600;letter-spacing:-0.02em;margin:0;color:var(--biru-tua);}
+.sj-laci-head p{margin:4px 0 0;}
+.sj-laci-status{padding:14px 0;}
+.sj-lampiran{margin-bottom:18px;}
+.sj-lampiran-img{display:block;width:100%;padding:0;border:1px solid var(--garis);background:#fff;cursor:zoom-in;}
+.sj-lampiran-img img{display:block;width:100%;max-height:330px;object-fit:contain;background:#fff;}
+.sj-lampiran-kosong{padding:32px;text-align:center;color:var(--tinta-lembut);border:1px dashed var(--garis);font-size:14px;}
+.sj-kv{display:grid;grid-template-columns:170px 1fr;gap:14px;padding:9px 0;border-bottom:1px solid var(--garis-tipis);align-items:baseline;}
+.sj-kv-l{font-family:'Archivo Narrow',sans-serif;font-size:14px;color:var(--tinta-lembut);}
+.sj-kv-v{font-size:15px;}
+.sj-verifikasi{margin-top:22px;padding-top:18px;border-top:2px solid var(--hijau);}
+.sj-zoom{position:fixed;inset:0;background:rgba(10,51,85,.92);display:flex;align-items:center;justify-content:center;padding:24px;z-index:50;cursor:zoom-out;}
+.sj-zoom img{max-width:100%;max-height:100%;object-fit:contain;background:#fff;}
+
+/* responsif */
+@media (max-width:900px){
+  .sj-masuk{grid-template-columns:1fr;}
+  .sj-masuk-kiri{padding:32px 20px;}
+  .sj-masuk-kanan{padding:26px 20px 44px;max-width:none;}
+  .sj-brand{font-size:38px;}
+  .sj-isi{padding:20px 14px;}
+  .sj-bar,.sj-nav,.sj-kabar,.sj-kaki{padding-left:14px;padding-right:14px;}
+  .sj-statbar,.sj-statbar-2{grid-template-columns:1fr 1fr;}
+  .sj-stat{padding:14px 16px;}
+  .sj-stat:nth-child(2){border-right:none;}
+  .sj-stat:nth-child(3),.sj-stat:nth-child(4){border-top:1px solid var(--garis);}
+  .sj-grid2{grid-template-columns:1fr;}
+  .sj-segmen{grid-template-columns:1fr;}
+  .sj-segmen button + button{border-left:none;border-top:1px solid var(--garis);}
+  .sj-panel{padding:16px;}
+  .sj-ruler-num{font-size:44px;}
+  .sj-thead{display:none;}
+  .sj-row3,.sj-row4,.sj-row5{grid-template-columns:1fr auto;gap:8px;}
+  .sj-row5 .sj-td:nth-child(2),.sj-row4 .sj-td:nth-child(3),.sj-row3 .sj-td:nth-child(2){display:none;}
+  .sj-td-aksi{grid-column:1 / -1;justify-content:flex-start;}
+  .sj-cari{min-width:0;flex:1;}
+  .sj-kv{grid-template-columns:1fr;gap:2px;}
+  .sj-laci{padding:18px 14px 36px;}
+  .sj-ruler-foot span:nth-child(2),.sj-ruler-foot span:nth-child(4){display:none;}
+}
+`;
